@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+#
+# git-change-author
+#
+# Rewrite author and committer identity for one email address.
+#
+# Default behaviour (no mode flags):
+#   - Match commits whose author or committer email equals --old-email
+#   - Rewrite those commits to --new-name and --new-email
+#   - Rewrite all branches and tags
+#   - Force-push every branch and tag to the remote
+#
+# WARNING: This is destructive when not in dry-run.
+#          Collaborators must fetch the rewritten history.
+#
+
+VERSION="0.0.0"
+
+REMOTE_NAME="origin"
+REMOTE_EXPLICIT="false"
+OLD_EMAIL=""
+NEW_EMAIL=""
+NEW_NAME=""
+GIT_DIR=""
+WORK_TREE=""
+
+DRY_RUN="false"
+ASSUME_YES="false"
+LOCAL_ONLY="false"
+SUMMARY_ONLY="false"
+PUSH_REMOTE="false"
+REMOTE_URL=""
+
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_BOLD=""
+COLOR_RESET=""
+
+STEP_CURRENT=0
+STEP_TOTAL=0
+STEP_LABEL=""
+ENV_FILTER=""
+
+init_colors()
+{
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+    then
+        COLOR_RED=$'\033[31m'
+        COLOR_GREEN=$'\033[32m'
+        COLOR_YELLOW=$'\033[33m'
+        COLOR_CYAN=$'\033[36m'
+        COLOR_BOLD=$'\033[1m'
+        COLOR_RESET=$'\033[0m'
+    fi
+}
+
+usage()
+{
+    cat <<EOF
+${COLOR_BOLD}Usage:${COLOR_RESET} $0 [options]
+
+Rewrite author and committer identity for one email address (destructive).
+
+Identity:
+  -o, --old-email EMAIL    Email address to replace (matched case-insensitively)
+  -e, --new-email EMAIL    Email address to write in its place
+  -N, --new-name NAME      Name to write for the new author and committer
+
+Remote:
+  -r, --remote NAME        Remote to force-push (default: ${REMOTE_NAME})
+  -L, --local-only         Rewrite locally and do not touch the remote
+
+Safety:
+  -n, --dry-run            Show what would be done, but don't change anything
+                           (commands are simulated)
+  -S, --summary            Print a detailed action plan based on all flags and exit.
+                           No rewrite, no prompts, no changes.
+  -y, --yes                Assume 'CHANGE' confirmation (non-interactive / CI mode)
+  -f, --force              Same as --yes
+
+Paths:
+  -d, --git-dir PATH       Path to the repository .git directory
+  -w, --work-tree PATH     Path to the working tree
+                           Pass both together when the repo is not the current directory.
+
+  -V, --version            Print version and exit
+  -h, --help               Show this help and exit
+EOF
+}
+
+error()
+{
+    echo "${COLOR_RED}ERROR:${COLOR_RESET} $*" >&2
+    exit 1
+}
+
+require_arg()
+{
+    if [ -z "${2:-}" ]
+    then
+        error "${1} requires an argument."
+    fi
+}
+
+prepare_git()
+{
+    GIT_CMD=(git)
+    if [ -n "${GIT_DIR}" ]
+    then
+        GIT_CMD+=(--git-dir "${GIT_DIR}")
+    fi
+    if [ -n "${WORK_TREE}" ]
+    then
+        GIT_CMD+=(--work-tree "${WORK_TREE}")
+    fi
+}
+
+lower()
+{
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+parse_args()
+{
+    while [ "$#" -gt 0 ]
+    do
+        case "$1" in
+            -o|--old-email)
+                require_arg "$1" "${2:-}"
+                OLD_EMAIL="$2"
+                shift 2
+                ;;
+            -e|--new-email)
+                require_arg "$1" "${2:-}"
+                NEW_EMAIL="$2"
+                shift 2
+                ;;
+            -N|--new-name)
+                require_arg "$1" "${2:-}"
+                NEW_NAME="$2"
+                shift 2
+                ;;
+            -r|--remote)
+                require_arg "$1" "${2:-}"
+                REMOTE_NAME="$2"
+                REMOTE_EXPLICIT="true"
+                shift 2
+                ;;
+            -d|--git-dir)
+                require_arg "$1" "${2:-}"
+                GIT_DIR="$2"
+                shift 2
+                ;;
+            -w|--work-tree)
+                require_arg "$1" "${2:-}"
+                WORK_TREE="$2"
+                shift 2
+                ;;
+            -L|--local-only)
+                LOCAL_ONLY="true"
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            -S|--summary)
+                SUMMARY_ONLY="true"
+                shift
+                ;;
+            -y|--yes|-f|--force)
+                ASSUME_YES="true"
+                shift
+                ;;
+            -v|-V|--version)
+                echo "git-change-author ${VERSION}"
+                exit 0
+                ;;
+            -h|--help|-\?)
+                usage
+                exit 0
+                ;;
+            -*)
+                echo "${COLOR_RED}ERROR:${COLOR_RESET} Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                error "Unexpected argument: $1"
+                ;;
+        esac
+    done
+
+    if [ -z "${OLD_EMAIL}" ] || [ -z "${NEW_EMAIL}" ] || [ -z "${NEW_NAME}" ]
+    then
+        usage
+        error "--old-email, --new-email, and --new-name are required."
+    fi
+
+    if [ -n "${GIT_DIR}" ] && [ -z "${WORK_TREE}" ]
+    then
+        error "--git-dir must be used with --work-tree."
+    fi
+    if [ -n "${WORK_TREE}" ] && [ -z "${GIT_DIR}" ]
+    then
+        error "--work-tree must be used with --git-dir."
+    fi
+    if [ "${LOCAL_ONLY}" = "true" ] && [ "${REMOTE_EXPLICIT}" = "true" ]
+    then
+        error "Cannot use --local-only and --remote together."
+    fi
+
+    OLD_EMAIL="$(lower "${OLD_EMAIL}")"
+}
+
+require_repo()
+{
+    prepare_git
+    if ! "${GIT_CMD[@]}" rev-parse --is-inside-work-tree >/dev/null 2>&1
+    then
+        error "This does not appear to be a Git repository."
+    fi
+}
+
+email_in_history()
+{
+    local line lowered
+    while IFS= read -r line
+    do
+        [ -n "${line}" ] || continue
+        lowered="$(lower "${line}")"
+        if [ "${lowered}" = "${OLD_EMAIL}" ]
+        then
+            return 0
+        fi
+    done < <("${GIT_CMD[@]}" log --pretty=tformat:'%ae%n%ce' --all 2>/dev/null || true)
+    return 1
+}
+
+list_authors()
+{
+    "${GIT_CMD[@]}" log --pretty=tformat:'%an <%ae>' --all 2>/dev/null | sort -u
+}
+
+resolve_remote()
+{
+    local remotes
+    PUSH_REMOTE="false"
+    REMOTE_URL=""
+
+    if [ "${LOCAL_ONLY}" = "true" ]
+    then
+        return 0
+    fi
+
+    remotes="$("${GIT_CMD[@]}" remote 2>/dev/null || true)"
+    if [ -z "${remotes}" ]
+    then
+        if [ "${REMOTE_EXPLICIT}" = "true" ]
+        then
+            error "Remote '${REMOTE_NAME}' does not exist in this repository."
+        fi
+        return 0
+    fi
+
+    if ! REMOTE_URL="$("${GIT_CMD[@]}" config --get "remote.${REMOTE_NAME}.url" 2>/dev/null)"
+    then
+        error "Remote '${REMOTE_NAME}' does not exist in this repository."
+    fi
+    if [ -z "${REMOTE_URL}" ]
+    then
+        error "Remote '${REMOTE_NAME}' does not exist in this repository."
+    fi
+    PUSH_REMOTE="true"
+}
+
+count_planned_steps()
+{
+    STEP_TOTAL=1
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+}
+
+begin_step()
+{
+    STEP_CURRENT=$((STEP_CURRENT + 1))
+    STEP_LABEL="[${STEP_CURRENT}/${STEP_TOTAL}]"
+}
+
+print_action_plan()
+{
+    local authors line
+    echo
+    echo "${COLOR_BOLD}=== ACTION PLAN ===${COLOR_RESET}"
+    echo "Old email:        ${OLD_EMAIL}"
+    echo "New email:        ${NEW_EMAIL}"
+    echo "New name:         ${NEW_NAME}"
+    if [ "${OLD_EMAIL}" = "$(lower "${NEW_EMAIL}")" ]
+    then
+        echo "Match effect:     name only (email is unchanged)"
+    else
+        echo "Match effect:     author and committer email and name"
+    fi
+    echo "Rewrite:          all branches and tags (git filter-branch)"
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        echo "Remote:           ${REMOTE_NAME}"
+        echo "Remote URL:       ${REMOTE_URL}"
+        echo "After rewrite:    git push --force --tags ${REMOTE_NAME} refs/heads/*"
+    else
+        echo "Remote:           (not touched)"
+    fi
+    echo "Dry-run:          ${DRY_RUN}"
+    echo "Summary-only:     ${SUMMARY_ONLY}"
+    echo
+    echo "Current authors:"
+    authors="$(list_authors || true)"
+    if [ -n "${authors}" ]
+    then
+        while IFS= read -r line
+        do
+            printf '  %s\n' "${line}"
+        done <<< "${authors}"
+    else
+        echo "  (none)"
+    fi
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}No commands have been executed because --summary was used.${COLOR_RESET}"
+    fi
+}
+
+confirm()
+{
+    local answer
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}${COLOR_YELLOW}DRY-RUN:${COLOR_RESET} No changes will be made. Commands will be simulated."
+        echo
+        return
+    fi
+
+    echo
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo " ${COLOR_RED}DANGER:${COLOR_RESET} This will IRREVERSIBLY rewrite Git history."
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo
+
+    if [ "${ASSUME_YES}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}--yes supplied, proceeding without interactive confirmation.${COLOR_RESET}"
+        return
+    fi
+
+    if ! read -r -p "Type 'CHANGE' to continue, or anything else to abort: " answer
+    then
+        echo
+        error "No confirmation received. Pass --yes to run non-interactively."
+    fi
+    if [ "${answer}" != "CHANGE" ]
+    then
+        echo "Aborted."
+        exit 1
+    fi
+}
+
+run()
+{
+    local desc
+    desc="$1"
+    shift
+
+    echo
+    if [ -n "${STEP_LABEL}" ]
+    then
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL} ${desc}${COLOR_RESET}"
+    else
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${desc}${COLOR_RESET}"
+    fi
+    echo "    $*"
+
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+        return 0
+    fi
+
+    if ! "$@"
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} ${desc} failed. Aborting." >&2
+        exit 1
+    fi
+}
+
+build_env_filter()
+{
+    local old_q name_q email_q
+    old_q="$(printf '%q' "${OLD_EMAIL}")"
+    name_q="$(printf '%q' "${NEW_NAME}")"
+    email_q="$(printf '%q' "${NEW_EMAIL}")"
+    ENV_FILTER="$(cat <<EOF
+if [ "\$(printf '%s' "\$GIT_COMMITTER_EMAIL" | tr '[:upper:]' '[:lower:]')" = ${old_q} ]; then export GIT_COMMITTER_NAME=${name_q}; export GIT_COMMITTER_EMAIL=${email_q}; fi; if [ "\$(printf '%s' "\$GIT_AUTHOR_EMAIL" | tr '[:upper:]' '[:lower:]')" = ${old_q} ]; then export GIT_AUTHOR_NAME=${name_q}; export GIT_AUTHOR_EMAIL=${email_q}; fi
+EOF
+)"
+}
+
+rewrite_history()
+{
+    build_env_filter
+    begin_step
+    run "Rewriting author and committer for '${OLD_EMAIL}'" \
+        env FILTER_BRANCH_SQUELCH_WARNING=1 \
+        "${GIT_CMD[@]}" filter-branch -f --env-filter "${ENV_FILTER}" --tag-name-filter cat -- --branches --tags
+
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        begin_step
+        run "Force-pushing branches and tags to '${REMOTE_NAME}'" \
+            "${GIT_CMD[@]}" push --force --tags "${REMOTE_NAME}" 'refs/heads/*'
+    fi
+}
+
+print_summary()
+{
+    echo
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}Dry-run complete. No changes were made.${COLOR_RESET}"
+        return
+    fi
+
+    echo "${COLOR_GREEN}All done.${COLOR_RESET}"
+    echo "Old email:          ${OLD_EMAIL}"
+    echo "New identity:       ${NEW_NAME} <${NEW_EMAIL}>"
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        echo "Remote:             force-pushed to ${REMOTE_NAME}"
+        echo "Collaborators must fetch the rewritten history and rebase local work onto it."
+    else
+        echo "Remote:             not touched"
+    fi
+}
+
+main()
+{
+    init_colors
+    parse_args "$@"
+    require_repo
+
+    if ! email_in_history
+    then
+        error "The email '${OLD_EMAIL}' does not exist in this repository's commit history."
+    fi
+
+    resolve_remote
+    count_planned_steps
+    print_action_plan
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        exit 0
+    fi
+
+    confirm
+    rewrite_history
+    print_summary
+}
+
+main "$@"
