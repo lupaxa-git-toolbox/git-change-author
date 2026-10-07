@@ -14,7 +14,7 @@
 #          Collaborators must fetch the rewritten history.
 #
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 REMOTE_NAME="origin"
 REMOTE_EXPLICIT="false"
